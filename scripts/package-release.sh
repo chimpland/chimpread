@@ -33,7 +33,7 @@ has not yet been verified. Drafts and connector permissions stay local.
 
 Chrome extension setup: chimpread > Integrations > Show Extension.
 Source, license, setup, and issue reporting:
-https://github.com/benfngu/chimpread
+https://github.com/chimpland/chimpread
 TEXT
 hdiutil create -volname "chimpread $version" -srcfolder "$stage" -format UDZO -ov "$out/chimpread-$version-arm64.dmg"
 hdiutil verify "$out/chimpread-$version-arm64.dmg"

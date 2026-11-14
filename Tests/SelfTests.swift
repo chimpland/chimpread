@@ -154,7 +154,10 @@ func fixturePDF(at url: URL, title: String, pages: Int = 3) throws {
     let sidecar = groupedStore.root.appendingPathComponent("organization.json")
     let plan = OrganizationUpdate(version: 1, papers: [.init(id: main.id, priority: 100), .init(id: supplement.id, parentID: main.id)])
     try JSONEncoder().encode(plan).write(to: sidecar, options: .atomic)
-    try expect(groupedStore.refreshOrganization() && groupedStore.library.papers[1].parentID == main.id, "Sidecar groups support files under their paper")
+    try expect(groupedStore.refreshOrganization() && groupedStore.library.papers[1].parentID == nil, "Sidecar requires review before grouping")
+    let reviewedPlans = ResearchPlans(store: groupedStore)
+    try reviewedPlans.accept(Set(reviewedPlans.pending.map(\.id)))
+    try expect(groupedStore.library.papers[1].parentID == main.id, "Reviewed sidecar groups support files")
     try expect(!groupedStore.refreshOrganization(), "Unchanged sidecar does not rewrite the library")
     groupedStore.markOpened(supplement.id)
     let recent = groupedStore.library.papers[0].lastOpened

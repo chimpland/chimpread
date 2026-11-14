@@ -2,6 +2,7 @@ import Foundation
 import PDFKit
 import CryptoKit
 import Combine
+import Darwin
 
 struct Paper: Codable, Identifiable, Equatable, Sendable {
     var id: UUID = UUID()
@@ -44,6 +45,8 @@ struct Library: Codable, Sendable {
     var version = 1
     var papers: [Paper] = []
     var collections: [String] = []
+    // Local commit receipts for crash recovery. Optional for existing v1 libraries.
+    var researchTransactionIDs: [UUID]?
 }
 
 enum ShelfError: LocalizedError {
@@ -178,7 +181,6 @@ final class ShelfStore: ObservableObject {
     @Published var report: String?
     let root: URL
     private(set) var writable = true
-    private var organizationData: Data?
     private var loadedIndex: Data?
     var files: URL { root.appendingPathComponent("PDFs", isDirectory: true) }
     var index: URL { root.appendingPathComponent("library.json") }
@@ -214,7 +216,16 @@ final class ShelfStore: ObservableObject {
     @discardableResult func commit(_ value: Library) -> Bool {
         guard writable else { error = "Library is read-only because it could not be loaded safely."; return false }
         do {
+            var value = value
+            // Keep local recovery receipts even when older callers construct a fresh Library.
+            let receipts = Set(library.researchTransactionIDs ?? []).union(value.researchTransactionIDs ?? [])
+            if !receipts.isEmpty { value.researchTransactionIDs = receipts.sorted { $0.uuidString < $1.uuidString } }
             try Self.validate(value)
+            // Serialize check-and-replace across cooperating app processes.
+            let descriptor = open(root.appendingPathComponent("library-write.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+            guard descriptor >= 0 else { throw ShelfError.message("Cannot lock library") }
+            defer { flock(descriptor, LOCK_UN); close(descriptor) }
+            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { throw ShelfError.message("Another process is saving the library") }
             let disk = try? Data(contentsOf: index)
             guard disk == loadedIndex else { throw ShelfError.message("The library changed in another process. Reopen chimpread before editing; your files were not overwritten.") }
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -246,34 +257,11 @@ final class ShelfStore: ObservableObject {
         commit(next)
     }
 
-    // Hermes writes only a small sidecar. The running app remains the sole index writer.
+    // Legacy organization files are proposals only; never a bypass around review.
     @discardableResult func refreshOrganization() -> Bool {
-        guard writable, !importing,
-              let data = try? Data(contentsOf: root.appendingPathComponent("organization.json")),
-              data != organizationData else { return false }
-        do {
-            let plan = try JSONDecoder().decode(OrganizationUpdate.self, from: data)
-            guard plan.version == 1, Set(plan.papers.map(\.id)).count == plan.papers.count else { return false }
-            var next = library
-            let indices = Dictionary(uniqueKeysWithValues: next.papers.enumerated().map { ($0.element.id, $0.offset) })
-            for entry in plan.papers {
-                guard let i = indices[entry.id], next.papers[i].organizationLocked != true else { continue }
-                if let parent = entry.parentID {
-                    guard parent != entry.id, indices[parent] != nil else { return false }
-                    next.papers[i].parentID = parent
-                }
-                if let priority = entry.priority { next.papers[i].priority = priority }
-            }
-            // A single supporting-file level prevents cycles and hidden nested documents.
-            for paper in next.papers {
-                if let parent = paper.parentID {
-                    guard let i = indices[parent], next.papers[i].parentID == nil else { return false }
-                }
-            }
-            if next.papers != library.papers && !commit(next) { return false }
-            organizationData = data
-            return true
-        } catch { return false } // An incomplete/bad suggestion never damages the library.
+        guard writable, !importing, !syncing else { return false }
+        do { return try ResearchPlans(store: self).importLegacy() }
+        catch { self.error = "Could not read organization suggestions: \(error.localizedDescription)"; return false }
     }
     @discardableResult func renameCollection(_ old: String, to rawName: String) -> Bool {
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)

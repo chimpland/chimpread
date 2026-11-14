@@ -13,6 +13,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     var browserTimer: Timer?
     var cloud: CloudController!
     var cloudWindow: NSWindow?
+    private var pendingSourceURLs: [URL] = []
+    private var sourceRequest = UUID()
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard store != nil else { pendingSourceURLs = Array(urls.prefix(1)); return }
+        if let url = urls.first { openSourceURL(url) }
+    }
+    private func openSourceURL(_ url: URL) {
+        guard let target = ObsidianLinks.parse(url),
+              let paper = store.library.papers.first(where: { $0.id == target.paperID }) else {
+            sourceAlert("This paper link is unavailable in the current library."); return
+        }
+        if let libraryID = target.libraryID, (try? ObsidianLibraryIdentity.id(root: store.root)) != libraryID {
+            sourceAlert("This link belongs to another Chimpread library."); return
+        }
+        guard reader.save() else { sourceAlert(reader.error ?? "Could not save the open paper."); return }
+        let request = UUID(); sourceRequest = request
+        let base = store.files.resolvingSymlinksInPath()
+        let file = base.appendingPathComponent(paper.filename).resolvingSymlinksInPath()
+        guard !paper.hasPDF || file.deletingLastPathComponent() == base else { sourceAlert("The source is outside this library."); return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let matches = target.revision.map { expected in (try? Importer.hash(file)) == expected } ?? true
+            DispatchQueue.main.async {
+                guard let self, self.sourceRequest == request else { return }
+                guard self.reader.open(paper, in: self.store.files) else { self.sourceAlert(self.reader.error ?? "The PDF could not be opened."); return }
+                self.window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+                guard matches else { self.sourceAlert("The PDF changed since this link was saved. The paper is open, but the old passage has not been verified."); return }
+                if let annotationID = target.annotationID, let row = self.reader.annotations.first(where: { $0.id.lowercased() == annotationID.lowercased() }) {
+                    self.reader.jump(row); return
+                }
+                if let page = target.page {
+                    guard let document = self.reader.view.document, page <= document.pageCount, let destination = document.page(at: page - 1) else {
+                        self.sourceAlert("This page is no longer available. The paper is open."); return
+                    }
+                    self.reader.view.go(to: destination)
+                }
+                if target.annotationID != nil { self.reader.status = "The annotation changed; opened its source page." }
+            }
+        }
+    }
+    private func sourceAlert(_ text: String) {
+        let alert = NSAlert(); alert.messageText = "Paper link"; alert.informativeText = text; alert.addButton(withTitle: "OK"); alert.runModal()
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let iconName = Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") as? String,
            let iconURL = Bundle.main.url(forResource: iconName, withExtension: "icns"),
@@ -52,6 +94,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             return ($0.priority ?? 0) > ($1.priority ?? 0)
         }).first { _ = reader.open(recent, in: store.files) }
     }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if store != nil, let url = pendingSourceURLs.first { pendingSourceURLs = []; openSourceURL(url) }
+    }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if store?.importing == true {
             let alert = NSAlert(); alert.messageText = "An import is still running"; alert.informativeText = "Let it finish before quitting so the imported files can be recorded safely."; alert.runModal()
@@ -87,7 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
     @objc func showIntegrations() {
         if integrationsWindow == nil {
-            let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 548, height: 380), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 548, height: 570), styleMask: [.titled, .closable], backing: .buffered, defer: false)
             panel.title = "Integrations"; panel.isReleasedWhenClosed = false
             panel.contentView = NSHostingView(rootView: IntegrationsView(root: store.root))
             panel.center(); integrationsWindow = panel
@@ -124,6 +169,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let item = NSToolbarItem(itemIdentifier: identifier)
         if identifier.rawValue == "import" {
             item.label = "Import"; item.toolTip = "Import Papers (⌘O)"; item.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: "Import Papers"); item.action = #selector(importFiles)
+            item.view = NSHostingView(rootView: HStack(spacing: 3) {
+                Button { [weak self] in self?.importFiles() } label: {
+                    Image(systemName: "square.and.arrow.down")
+                }.buttonStyle(.borderless).accessibilityLabel("Import Papers")
+                ShortcutHint("⌘O", action: "Import", id: "import")
+            }.fixedSize())
         } else if identifier.rawValue == "collection" {
             item.label = "New Collection"; item.toolTip = "New Collection"; item.image = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: "New Collection"); item.action = #selector(newCollection)
         } else { return nil }
@@ -133,9 +184,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     @objc func printPaper() { reader.printPaper() }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(printPaper) { return reader.view.document != nil }
+        if menuItem.action == #selector(exportObsidian) { return reader.paperID != nil }
         return true
     }
     @objc func exportPDF() { reader.exportPDF() }
+    @objc func exportObsidian() { NotificationCenter.default.post(name: .shelfExportObsidian, object: nil) }
+    @objc func chooseObsidian() { NotificationCenter.default.post(name: .shelfChooseObsidian, object: nil) }
     @objc func highlight() { reader.highlight() }
     @objc func showHelp() {
         let alert = NSAlert()
@@ -164,6 +218,8 @@ func makeMenus(_ delegate: AppDelegate) {
     let bibliography = file.addItem(withTitle: "Bibliography…", action: #selector(AppDelegate.showBibliography), keyEquivalent: "b"); bibliography.target = delegate
     let save = file.addItem(withTitle: "Save Annotations", action: #selector(AppDelegate.save), keyEquivalent: "s"); save.target = delegate
     let export = file.addItem(withTitle: "Export Annotated PDF…", action: #selector(AppDelegate.exportPDF), keyEquivalent: "e"); export.target = delegate; export.keyEquivalentModifierMask = .command
+    let obsidian = file.addItem(withTitle: "Open in Obsidian", action: #selector(AppDelegate.exportObsidian), keyEquivalent: "o"); obsidian.target = delegate; obsidian.keyEquivalentModifierMask = [.command, .shift]
+    let vault = file.addItem(withTitle: "Choose Obsidian Vault…", action: #selector(AppDelegate.chooseObsidian), keyEquivalent: ""); vault.target = delegate
     let printItem = file.addItem(withTitle: "Print…", action: #selector(AppDelegate.printPaper), keyEquivalent: "p"); printItem.target = delegate
     file.addItem(.separator()); file.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
     fileItem.submenu = file; menu.addItem(fileItem)
@@ -203,11 +259,19 @@ if CommandLine.arguments.contains("--mcp") || CommandLine.arguments.contains("--
 }
 let app = NSApplication.shared
 if CommandLine.arguments.contains("--self-test") {
-    do { try runSelfTests(); try runConnectorTests(); try runCloudTests(); exit(0) }
+    do { try runSelfTests(); try runConnectorTests(); try runCloudTests(); try runResearchIndexTests(); try runResearchControllerTests(); try runResearchPlanTests(); try runAIProviderTests(); try ObsidianTests.run(); try ObsidianLinksTests.run(); try ObsidianSnapshotTests.run(); try ObsidianArtifactsTests.run(); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
+if CommandLine.arguments.contains("--obsidian-memory-test") {
+    do { try runObsidianMemoryTests(); exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
 if CommandLine.arguments.contains("--memory-test") {
     do { try runMemoryTest(); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
+if CommandLine.arguments.contains("--research-memory-test") {
+    do { try runResearchMemoryTests(); exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
 if let index = CommandLine.arguments.firstIndex(of: "--make-demo"), index + 1 < CommandLine.arguments.count {

@@ -17,9 +17,41 @@ enum LibraryFilter: Hashable {
     }
 }
 
+/// Inline hints remember dismissal across windows and app launches.
+struct ShortcutHint: View {
+    let shortcut: String
+    let actionName: String
+    @AppStorage private var dismissed: Bool
+
+    init(_ shortcut: String, action: String, id: String) {
+        self.shortcut = shortcut
+        self.actionName = action
+        _dismissed = AppStorage(wrappedValue: false, "shortcutHint.dismissed." + id)
+    }
+
+    var body: some View {
+        if !dismissed {
+            HStack(spacing: 2) {
+                Text(shortcut).font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .accessibilityLabel("\(actionName) shortcut: \(shortcut)")
+                Button { dismissed = true } label: {
+                    Image(systemName: "xmark").font(.system(size: 7, weight: .medium))
+                        .frame(width: 14, height: 16).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Hide \(actionName) shortcut hint permanently")
+                .help("Hide this shortcut hint permanently")
+            }
+            .foregroundStyle(.secondary)
+            .fixedSize()
+        }
+    }
+}
+
 struct ShelfView: View {
     @ObservedObject var store: ShelfStore
     @ObservedObject var reader: Reader
+    @StateObject private var obsidian: ObsidianExportController
     @State private var filter: LibraryFilter? = .reading
     @State private var selection: UUID?
     @State private var query = ""
@@ -36,6 +68,11 @@ struct ShelfView: View {
     @State private var editingPaper: Paper?
     @State private var pdfSearch = ""
     @State private var dropping = false
+    @State private var showResearch = false
+    init(store: ShelfStore, reader: Reader) {
+        self.store = store; self.reader = reader
+        _obsidian = StateObject(wrappedValue: ObsidianExportController(store: store, reader: reader))
+    }
     private var active: Paper? { store.library.papers.first { $0.id == reader.paperID } }
     private var selectedCollection: String? { if case .collection(let name) = filter { return name }; return nil }
     private var allTags: [String] {
@@ -125,8 +162,23 @@ struct ShelfView: View {
         .disabled(store.syncing)
         .onReceive(NotificationCenter.default.publisher(for: .shelfImport)) { _ in chooseImport() }
         .onReceive(NotificationCenter.default.publisher(for: .shelfSave)) { _ in _ = reader.save(); reader.rememberPage() }
+        .onReceive(NotificationCenter.default.publisher(for: .shelfExportObsidian)) { _ in
+            if let active { obsidian.export(paper: active) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .shelfChooseObsidian)) { _ in obsidian.chooseVault() }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("chimpread.exportResearchAnswer"))) { notification in
+            if let snapshot = notification.object as? ResearchAnswerSnapshot { obsidian.saveAnswer(snapshot) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("chimpread.exportResearchNote"))) { notification in
+            if let note = notification.object as? ObsidianResearchNote { obsidian.saveResearchNote(note) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("chimpread.readerSaved"))) { notification in
+            if let id = notification.object as? UUID { obsidian.scheduleRefresh(paperID: id) }
+        }
+        .onChange(of: active?.notes) { _, _ in if let active { obsidian.scheduleRefresh(paperID: active.id) } }
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in reader.syncNativeAnnotations() }
         .onReceive(NotificationCenter.default.publisher(for: .shelfCollection)) { _ in newCollection = ""; addingCollection = true }
+        .sheet(isPresented: $showResearch) { ResearchView(store: store, reader: reader) }
         .sheet(item: $editingPaper) { paper in PaperEditor(paper: paper, store: store) }
         .alert("Rename Collection", isPresented: Binding(get: { renamingCollection != nil }, set: { if !$0 { renamingCollection = nil } })) {
             TextField("Name", text: $renameText)
@@ -156,6 +208,11 @@ struct ShelfView: View {
     }
     private var sidebar: some View {
         VStack(spacing: 0) {
+            Button { showResearch = true } label: {
+                Label("Ask your library", systemImage: "magnifyingglass")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }.buttonStyle(.plain).padding(12)
+            Divider()
             List(selection: $filter) {
                 Section("Library") {
                     Label("Continue Reading", systemImage: "book").tag(LibraryFilter.reading)
@@ -168,7 +225,16 @@ struct ShelfView: View {
                 Section("Collections") {
                     ForEach(store.library.collections, id: \.self) { name in
                         Label(name, systemImage: "folder").tag(LibraryFilter.collection(name))
-                            .contextMenu { Button("Rename…") { renameText = name; renamingCollection = name } }
+                            .contextMenu {
+                                Button("Open reading page in Obsidian") { obsidian.collection(name) }
+                                Button("Save a question…") { obsidian.questions(name) }
+                                Menu("More Obsidian actions") {
+                                    Button("Create canvas snapshot") { obsidian.collection(name, canvas: true) }
+                                    Button("Refresh linked notes") { obsidian.refreshCollection(name) }
+                                }.disabled(obsidian.exporting)
+                                Divider()
+                                Button("Rename…") { renameText = name; renamingCollection = name }
+                            }
                     }
                 }
                 if !allTags.isEmpty {
@@ -194,6 +260,11 @@ struct ShelfView: View {
             }.padding(8)
             Divider()
             if store.importing { ProgressView("Importing…").controlSize(.small).padding(10) }
+            if obsidian.exporting {
+                HStack { ProgressView().controlSize(.small); Text(obsidian.status).font(.caption); Button("Stop") { obsidian.cancel() } }.padding(8)
+            } else if !obsidian.status.isEmpty {
+                Text(obsidian.status).font(.caption).foregroundStyle(.secondary).lineLimit(3).padding(6)
+            }
             List(selection: $selection) {
                 ForEach(paperGroups) { group in
                     if group.supporting.isEmpty {
@@ -268,6 +339,7 @@ struct ShelfView: View {
             Button("Copy Citation") {
                 do { let text = try Citations.render([paper], style: .apa, inline: true); NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string) } catch { store.error = error.localizedDescription }
             }
+            Button("Open in Obsidian") { obsidian.export(paper: paper) }.disabled(obsidian.exporting)
             if paper.hasPDF {
                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([store.files.appendingPathComponent(paper.filename)]) }
             } else { Button("Attach PDF…") { attachPDF(paper) } }
@@ -290,8 +362,14 @@ struct ShelfView: View {
                 }.padding(30).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             } else if let active {
                 HStack(spacing: 12) {
-                    Button { reader.highlight() } label: { Image(systemName: "highlighter") }.help("Highlight Selected Text (⌘L)").keyboardShortcut("l", modifiers: .command)
-                    Button { startNote() } label: { Image(systemName: "note.text.badge.plus") }.help("New Note (⌘N)").keyboardShortcut("n", modifiers: .command)
+                    HStack(spacing: 3) {
+                        Button { reader.highlight() } label: { Image(systemName: "highlighter") }.help("Highlight Selected Text (⌘L)").keyboardShortcut("l", modifiers: .command)
+                        ShortcutHint("⌘L", action: "Highlight", id: "highlight")
+                    }
+                    HStack(spacing: 3) {
+                        Button { startNote() } label: { Image(systemName: "note.text.badge.plus") }.help("New Note (⌘N)").keyboardShortcut("n", modifiers: .command)
+                        ShortcutHint("⌘N", action: "New Note", id: "newNote")
+                    }
                     Divider().frame(height: 16)
                     Button { reader.view.zoomOut(nil) } label: { Image(systemName: "minus.magnifyingglass") }.help("Zoom Out")
                     Button { reader.view.zoomIn(nil) } label: { Image(systemName: "plus.magnifyingglass") }.help("Zoom In")
@@ -303,8 +381,26 @@ struct ShelfView: View {
                     Spacer(minLength: 4)
                     Button { editingPaper = active } label: { Image(systemName: "info.circle") }.help("Paper Details")
                     Button { showAnnotations.toggle() } label: { Image(systemName: "sidebar.right") }.help("Annotations")
-                    Button { reader.printPaper() } label: { Image(systemName: "printer") }.help("Print (⌘P)").accessibilityLabel("Print")
-                    Button { reader.exportPDF() } label: { Image(systemName: "square.and.arrow.up") }.help("Export PDF")
+                    HStack(spacing: 3) {
+                        Button { reader.printPaper() } label: { Image(systemName: "printer") }.help("Print (⌘P)").accessibilityLabel("Print")
+                        ShortcutHint("⌘P", action: "Print", id: "print")
+                    }
+                    Menu {
+                        Button("Export Annotated PDF…") { reader.exportPDF() }
+                        Button("Open in Obsidian") { obsidian.export(paper: active) }.disabled(obsidian.exporting)
+                        Menu("Obsidian options") {
+                            Button("Update without opening") { obsidian.export(paper: active, open: false) }
+                            Button("Include PDF for other devices…") { obsidian.export(paper: active, portable: true) }
+                            Button("Connect existing note…") { obsidian.locate(paper: active, attach: true) }
+                            Button("Locate moved note…") { obsidian.locate(paper: active) }
+                            Button("Copy paper link") { obsidian.copyPaperLink(active) }
+                            Divider()
+                            Toggle("Keep linked notes current", isOn: $obsidian.autoRefresh)
+                            Button("Change vault…") { obsidian.chooseVault() }
+                            Button("New-note template…") { obsidian.chooseTemplate() }
+                            Button("Reset template") { obsidian.clearTemplate() }
+                        }.disabled(obsidian.exporting)
+                    } label: { Image(systemName: "square.and.arrow.up") }.menuStyle(.borderlessButton).fixedSize().help("Export").accessibilityLabel("Export")
                     Button { _ = reader.open(nil, in: store.files) } label: { Image(systemName: "xmark") }.help("Close PDF")
                 }.buttonStyle(.borderless).padding(.horizontal, 12).padding(.vertical, 9)
                 Divider()
@@ -327,7 +423,10 @@ struct ShelfView: View {
             } else {
                 VStack(spacing: 10) {
                     Text("Select a paper").foregroundStyle(.secondary)
-                    Button("Import…", action: chooseImport).disabled(store.importing)
+                    HStack(spacing: 3) {
+                        Button("Import…", action: chooseImport).disabled(store.importing)
+                        ShortcutHint("⌘O", action: "Import", id: "import")
+                    }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -362,6 +461,7 @@ struct ShelfView: View {
                 }.padding(.vertical, 4)
                 .contextMenu {
                     Button("Go to Passage") { reader.jump(row) }
+                    if let active { Button("Copy for Obsidian") { obsidian.copy(paper: active, row: row) } }
                     Button("Edit Note…") { startNote(row) }
                     Button("Delete Annotation") { reader.delete(row) }
                 }
@@ -394,6 +494,7 @@ struct ShelfView: View {
                         Button("Save Note") { if reader.finishNote() { noteFocused = false } }
                             .keyboardShortcut(.return, modifiers: .command)
                             .disabled(draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        ShortcutHint("⌘↩", action: "Save Note", id: "saveNote")
                     }
                 }.padding(10)
             }
@@ -476,6 +577,8 @@ struct PaperEditor: View {
 }
 
 extension Notification.Name {
+    static let shelfExportObsidian = Notification.Name("PaperShelf.exportObsidian")
+    static let shelfChooseObsidian = Notification.Name("PaperShelf.chooseObsidian")
     static let shelfImport = Notification.Name("PaperShelf.import")
     static let shelfSave = Notification.Name("PaperShelf.save")
     static let shelfCollection = Notification.Name("PaperShelf.collection")

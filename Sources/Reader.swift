@@ -147,6 +147,7 @@ final class Reader: NSObject, ObservableObject {
             _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
             savedAnnotationState = state
             dirty = false; status = "Saved · \(Date().formatted(date: .omitted, time: .shortened))"
+            if let paperID { NotificationCenter.default.post(name: Notification.Name("chimpread.readerSaved"), object: paperID) }
             return true
         } catch {
             try? FileManager.default.removeItem(at: temporary)

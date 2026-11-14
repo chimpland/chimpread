@@ -6,8 +6,8 @@ PDF annotations. No Electron, web server, required account, telemetry, or third-
 
 ## Download
 
-Visit the [landing page](https://chimpread.peppydaisy.chatgpt.site) or download the
-[Apple Silicon installer](https://github.com/benfngu/chimpread/releases/latest).
+Visit the [landing page](https://chimpread.com) or download the
+[Apple Silicon installer](https://github.com/chimpland/chimpread/releases/latest).
 Open the DMG and drag chimpread into Applications. Requires macOS 14 or later.
 The early release is ad-hoc signed, **not Apple-notarized**. If macOS blocks it,
 review [Apple’s guidance](https://support.apple.com/102445) before approving the app.
@@ -41,9 +41,10 @@ Open `chimpread.app`. Import PDFs or a Zotero RIS export with **File → Import 
 - Sorting by Recent, Title, Author, Newest, or Year persists between launches. Author sort
   uses the stored author string, not an inferred surname.
 
-The panes are resizable. Colors and type follow macOS. The app uses one PDFDocument
-at a time, loads imports sequentially off the UI thread, and does not build a global
-PDF text index or retain a library of PDF thumbnails.
+The panes are resizable. Colors and type follow macOS. The reader retains one active
+PDFDocument and imports run sequentially off the UI thread. Optional indexing extracts
+one PDF at a time on a background queue; it stores bounded text on disk, not a library
+of open PDFs or thumbnails. No model is bundled or started by the app.
 
 Reading starts in Page by Page mode. Use the Reading Layout menu beside the zoom
 controls to choose Continuous Scroll; your choice is remembered across launches.
@@ -61,6 +62,9 @@ Default library: `~/Library/Application Support/PaperShelf/`
 - `PDFs/`: independent copies, named with UUIDs to avoid filename collisions.
 - `NoteDrafts/`: unfinished note drafts, one small JSON file per paper.
 - `library.previous.json`: the metadata state before the latest successful save.
+- `ResearchIndex/`: optional, rebuildable local keyword index.
+- `research-plans.json`: local pending suggestions and undo journal.
+- `ai-settings.json`: optional provider/model settings; API keys stay in Keychain.
 
 Original PDFs and Zotero data are never modified by importing. Identical input PDFs
 are detected by SHA-256 streamed in 1 MiB chunks. Back up the whole library folder
@@ -131,7 +135,7 @@ or document-wide citation numbering. Live account insertion remains unverified u
 Requires an Apple Silicon Mac with macOS 14+ and Xcode Command Line Tools.
 
 ```sh
-git clone https://github.com/benfngu/chimpread.git
+git clone https://github.com/chimpland/chimpread.git
 cd chimpread
 ./build.sh
 open build/chimpread.app
@@ -142,6 +146,8 @@ for the app. Node.js and Python are only used for optional development tests.
 
 ```sh
 ./build/chimpread.app/Contents/MacOS/chimpread --self-test
+./build/chimpread.app/Contents/MacOS/chimpread --research-memory-test
+./build/chimpread.app/Contents/MacOS/chimpread --memory-test
 python3 Tests/test_native_host.py
 node --test Tests/extension.test.mjs
 # Optional: install the official Python mcp SDK in a virtual environment first.
@@ -184,33 +190,121 @@ Your working library remains local; nothing is uploaded until you opt in.
   **real delivery between two iCloud devices remains unverified**. Back up your library.
   No iOS/iPad app, CloudKit account service, or shared-library collaboration is included.
 
+## Ask your library (0.5.0)
+
+Click **Ask your library** in the sidebar. Search titles, authors, DOI, and tags immediately.
+Choose **Build Library Search Index** once to search passages across your PDFs. Indexing
+is explicit, incremental, cancelable between pages, and local. Search can be scoped to a
+collection; each passage opens its physical PDF page after checking the source revision.
+Scans without embedded text need OCR elsewhere. Keyword results are not an exhaustive review.
+
+**Organization suggestions** shows proposed changes, their reasons, and exact before/after
+values. **Find Suggestions** matches tags to existing collection names. Select suggestions
+and apply or dismiss them; **Undo Last Apply** reverses the last batch if its fields have not
+changed since. Older Hermes `organization.json` suggestions now enter this review flow.
+The app never automatically merges papers, replaces editions, or deletes PDFs.
+
+**Suggest with AI** previews metadata for up to 40 papers in the chosen scope, then sends
+only that preview after you click Send Metadata. Suggestions become reviewable collection
+changes. Successive passes advance through the scope; Cancel stops further work. New names
+are permitted, but nothing is applied automatically. Titles and tags alone cannot establish
+scientific relationships.
+
+Optional **AI Settings** supports OpenAI, Claude, Gemini, Ollama, and OpenAI-compatible
+endpoints. Supply a model ID and your API key; keys stay in this Mac's Keychain. A chat
+subscription is not necessarily API access. **Ask AI** sends only your question and the
+passages displayed above it. Answers are drafts, with source numbers to check yourself;
+a valid citation number does not prove a claim. **Append to Notes** is explicit and keeps
+existing notes and unfinished annotation drafts. **Save research note…** passes an immutable
+answer/source/model snapshot to the Obsidian connector without another model request.
+**Save passages…** works without AI.
+
+Use **Copy Evidence** with any assistant that accepts pasted text, or connect a compatible
+MCP client below. Provider protocols differ; this is not a promise that every AI/model works.
+No paid provider is required for search, manual organization, or reading.
+
+Resource limits include one index job and one AI request per app process, five displayed
+passages, a 128 MiB index database, a 4 MiB SQLite cache target, and bounded PDF/text input.
+AI output requests are capped at 1,800 tokens for answers or 4,096 for organization, with no automatic retry. Ollama is asked to unload after each request;
+its actual resource use depends on that server. PDFKit can still allocate substantial memory
+for complex PDFs. See the [implementation status](docs/plans/ai-update-implementation-status.md)
+for exact limits, testing, and deferred parts of the larger design.
+
+## Obsidian
+
+Choose **File → Open in Obsidian (⇧⌘O)** or the reader’s share menu. Choose a vault once;
+subsequent use updates and opens the same note. Without Obsidian, Finder reveals the Markdown.
+Your reader stays on its current paper while saved annotations are extracted on a serial worker.
+
+- New notes have readable, stable filenames, creation-only aliases, and space for your writing.
+  Existing UUID exports stay in place. Metadata and annotations have separately checked sections;
+  user text and properties outside them are preserved. Unknown annotation coverage never clears highlights.
+- **Copy for Obsidian** in an annotation’s context menu copies its text, citation and return link.
+  `chimpread://` links open the paper/page; native annotation IDs provide exact targets when available.
+  Exported source revisions detect changed PDFs. Imported annotations without durable IDs use page links.
+- Changed generated text creates an incoming version; identical conflicts reuse it. One local prior
+  version per identity is retained under `ObsidianRecovery/`. Coordinated writes and final byte checks
+  detect competing saves, but cannot guarantee every race with an uncoordinated editor.
+- **Locate moved note…** relinks a renamed note; file bookmarks can also resolve moves. Missing notes
+  are not silently replaced. **Connect existing note…** adds a managed section without rewriting its prose.
+- Right-click a collection for a reading page, an ordinary question note, or a Canvas snapshot (up to
+  20 papers). Reading pages link existing notes or Chimpread directly; they do not duplicate every paper.
+  Canvas files remain yours to arrange and connect; the connector invents no scientific relationships.
+- **Save research note…** in Ask your library saves the captured question, AI draft and exact supplied
+  passages with generation-time model information. **Save passages…** works without AI. PDF revisions
+  are checked before export. Saved research notes are user-owned, and saving does not mark them verified.
+- Optional **Include PDF for other devices…** copies a saved PDF with relative links. A synced vault
+  may upload that copy. Copies use content-derived names; edited copies are never replaced. Real
+  two-device delivery is not validated by local tests, and this does not provide a Chimpread mobile app.
+- **Keep linked notes current** is off by default. When enabled, successful saved annotation/note changes
+  trigger a debounced refresh of an already-connected paper. There is no vault watcher or startup sweep.
+  Busy work can defer a refresh; **Update without opening** or **Refresh linked notes** retries explicitly.
+- A plain Markdown template can seed new notes; reset it from Obsidian options. Existing notes are not
+  reformatted. Templates are not executed by Chimpread.
+
+The normal flow copies no PDFs and starts no model or background vault index. Extraction is limited
+to one temporary PDF at a time, 128 MiB input, 2,000 pages, 20,000 raw annotations / 10,000 groups,
+and 2 MiB annotation text. Notes/artifacts have a 4 MiB output cap. These are input limits, not a
+promise about PDFKit’s peak memory. Drafts are excluded. Imported source text is escaped rather than
+executed as Markdown, HTML, or plugin code. This remains one-way export with two-way navigation,
+not automatic editing of PDF annotations from Obsidian.
+
 ## MCP and Hermes
 
-Open **Integrations (⌘,)** and enable MCP access. PDF text and saved notes require
-a separate content-access toggle. Use **Copy MCP Config** or **Copy Hermes Config**
-to obtain paths for your installation. Merge the Hermes entry into
-`~/.hermes/config.yaml`, then reload MCP in Hermes. No client configuration is changed
-automatically and no model runs inside chimpread.
+Open **Integrations (⌘,)** and enable MCP access. PDF text and saved notes require a separate
+content-access toggle. Collection suggestions require their own permission. Use **Copy Generic
+MCP Config** or **Copy Hermes Config**, then merge the entry into your client's configuration.
+For Hermes, merge into `~/.hermes/config.yaml` and reload MCP. No client configuration is
+changed automatically. A connected client can send tool results to its selected model.
 
-The native executable supports `--mcp` over stdio. Tools are read-only:
-`search_papers`, `get_paper`, `read_pages`, and `read_notes`. Reading is bounded and
-returns page numbers; unfinished drafts are excluded. Disable access to revoke it
-on the next request. A connected client can send results to its selected model.
-The app also accepts an optional local `organization.json` sidecar; personal
-research rules and background schedules are not included in this repository.
+The native executable supports `--mcp` over stdio, with no listening network port:
+
+- `search_papers`, `get_paper`, `read_pages`, `read_notes`: bounded metadata/content reads.
+- `search_passages`, `get_index_status`: query an existing local index; never start indexing.
+- `propose_collection`: submit suggestions for review; cannot apply canonical changes.
+
+Disable access to revoke it on the next request. Permissions cover the library globally;
+archive visibility is not an access boundary. Drafts are excluded. Requests are synchronous
+and bounded; in-flight cancellation is not implemented. Real Hermes integration remains
+unverified; interoperability is tested with the official Python MCP SDK.
 
 ## Status and limitations
 
-Version 0.4.0 is an early native application. Migration, bibliography formatting,
-reader behavior, Chrome native messaging, and MCP have automated regression tests.
-Google Docs request construction is tested; live OAuth and document insertion still
-need verification with a configured account. The extension is distributed as unpacked
-source, not a Chrome Web Store release.
+Version 0.5.0 adds the first AI/library implementation slice. The broader design remains
+partly deferred: no semantic relationship graph, OCR, edition resolution, autonomous
+maintenance, comparison matrix, or synchronized research journal. Local keyword matching
+and metadata suggestions do not establish scientific relationships.
 
-No OCR, full-library text index, in-app LLM chat, or live citation fields.
-Different scans/editions may remain separate despite byte-level deduplication.
-Bibliographies depend on the completeness of imported metadata. Only the current
-paper stays open; PDFKit can still use substantial memory for complex documents.
+Migration, bibliography, reader behavior, Chrome native messaging, local research/indexing,
+review/undo, provider request formats, and Obsidian exports have synthetic regression tests.
+Authenticated provider calls, live Google Docs insertion, and real two-device iCloud delivery
+still need configured-account verification. The Chrome extension remains unpacked source.
+
+The index, provider settings, permissions, and proposal journal stay local. Accepted collection
+metadata uses the existing sync path. Use one GUI per library, and do not run older/newer app
+versions on the same library: older versions do not preserve the new transaction receipts.
+Different scans/editions may remain separate despite byte-level deduplication. Bibliographies
+depend on imported metadata; live citation fields are not included.
 
 ## License and credits
 
@@ -231,4 +325,4 @@ using OpenAI image generation at the author's request.
 Run `./scripts/package-release.sh` to build and verify a DMG, ZIP, and SHA-256 checksums
 under `build/release/<version>/`. No signing credentials are bundled. Public distribution
 currently uses an ad-hoc signature; Developer ID signing and notarization remain future work.
-The static landing page lives in `website/dist/` and has no third-party runtime, fonts, or analytics.
+The static landing page source lives in `website/dist/`; website deployment is separate from the native app build.
